@@ -1,6 +1,24 @@
 Changes
 =======
 
+Version 2.3.5
+-------------
+
+* Fixes for launching external processes (like diff) on Windows
+* Update the golden file on --accept if decoding the golden file failed with an exception
+* Do not depend on unix-compat
+
+Version 2.3.4
+-------------
+
+* Add an option to remove the output file after a test has run, if there is
+  a golden file, or one has been created
+
+Version 2.3.3.3
+---------------
+
+* Fix a bug where `goldenVsFileDiff` would not create a missing golden file
+
 Version 2.3.3.2
 ---------------
 
