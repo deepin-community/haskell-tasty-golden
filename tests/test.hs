@@ -1,15 +1,24 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE OverloadedStrings #-}
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.Golden
 import System.IO.Temp
 import System.FilePath
 import System.Directory
-import System.Process
+import System.Process.Typed
 import Data.List (sort)
 
 touch f = writeFile f ""
 diff ref new = ["diff", "-u", ref, new]
+
+-- Remove a .golden file that a golden test created due to the .golden file not
+-- existing prior to the start of the test.
+postCleanup :: String -> (FilePath -> TestTree) -> TestTree
+postCleanup fileName f =
+  withResource (return ()) (\_ -> removeFile filePath) (\_ -> f filePath)
+  where
+    filePath = "tests/golden" </> fileName <.> "golden"
 
 main = defaultMain $ testGroup "Tests"
   [ testCase "findByExtension" $
@@ -28,12 +37,41 @@ main = defaultMain $ testGroup "Tests"
       files <- findByExtension [".c", ".h"] basedir
       sort files @?= (sort . map (basedir </>))
         ["d1/d2/h1.c","d1/g1.c","f1.c","f2.h"]
+  , testGroup "Missing golden files"
+    -- Make sure that each entrypoint to tasty-golden can properly create
+    -- golden files if they are not provided. This serves as a regression test
+    -- for #32.
+    [ postCleanup "goldenVsFile" $ \golden ->
+      goldenVsFile
+        "goldenVsFile without golden file"
+        golden
+        "tests/golden/goldenVsFile.actual"
+        (touch "tests/golden/goldenVsFile.actual")
+    , postCleanup "goldenVsFileDiff" $ \golden ->
+      goldenVsFileDiff
+        "goldenVsFileDiff without golden file"
+        diff
+        golden
+        "tests/golden/goldenVsFileDiff.actual"
+         (touch "tests/golden/goldenVsFileDiff.actual")
+    , postCleanup "goldenVsString" $ \golden ->
+      goldenVsString
+        "goldenVsString without golden file"
+        golden
+        (return "")
+    , postCleanup "goldenVsStringDiff" $ \golden ->
+      goldenVsStringDiff
+        "goldenVsStringDiff without golden file"
+        diff
+        golden
+        (return "")
+    ]
 #ifdef BUILD_EXAMPLE
   , withResource
     (do
       tmp0 <- getCanonicalTemporaryDirectory
       tmp <- createTempDirectory tmp0 "golden-test"
-      callProcess "cp" ["-r", "example", tmp]
+      runProcess_ $ shell $ "cp -r example " ++ tmp
       return tmp
     )
     ({-removeDirectoryRecursive-}const $ return ()) $ \tmpIO ->
@@ -51,9 +89,10 @@ main = defaultMain $ testGroup "Tests"
           -- timings.
           --
           -- NB: cannot use multiline literals because of CPP.
-          callCommand ("cd " ++ tmp ++ " && example | " ++
-            "sed -Ee 's/[[:digit:]-]+\\.actual/.actual/g; s/ \\([[:digit:].]+s\\)//' > " ++
-            our</>"tests/golden/before-accept.actual || true")
+          let cmd = shell ("cd " ++ tmp ++ " && example | " ++
+                      "sed -Ee 's/[[:digit:]-]+\\.actual/.actual/g; s/ \\([[:digit:].]+s\\)//' > " ++
+                      our</>"tests/golden/before-accept.actual || true")
+          runProcess_ cmd
         )
     , after AllFinish "/before --accept/" $ goldenVsFileDiff
         "with --accept"
@@ -63,7 +102,9 @@ main = defaultMain $ testGroup "Tests"
         (do
           tmp <- tmpIO
           our <- getCurrentDirectory
-          callCommand ("cd " ++ tmp ++ " && example --accept | sed -Ee 's/ \\([[:digit:].]+s\\)//' > " ++ our </>"tests/golden/with-accept.actual")
+          let cmd = shell ("cd " ++ tmp ++ " && example --accept | sed -Ee 's/ \\([[:digit:].]+s\\)//' > " ++
+                          our </>"tests/golden/with-accept.actual")
+          runProcess_ cmd
         )
     , after AllFinish "/with --accept/" $ goldenVsFileDiff
         "after --accept"
@@ -73,7 +114,9 @@ main = defaultMain $ testGroup "Tests"
         (do
           tmp <- tmpIO
           our <- getCurrentDirectory
-          callCommand ("cd " ++ tmp ++ " && example | sed -Ee 's/ \\([[:digit:].]+s\\)//' > " ++ our</>"tests/golden/after-accept.actual")
+          let cmd = shell ("cd " ++ tmp ++ " && example | sed -Ee 's/ \\([[:digit:].]+s\\)//' > " ++
+                          our</>"tests/golden/after-accept.actual")
+          runProcess_ cmd
         )
     ]
 #endif

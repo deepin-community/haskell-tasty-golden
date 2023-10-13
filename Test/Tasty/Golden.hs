@@ -1,18 +1,23 @@
 {- |
+
+== Getting Started
 To get started with golden testing and this library, see
 <https://ro-che.info/articles/2017-12-04-golden-tests Introduction to golden testing>.
 
 This module provides a simplified interface. If you want more, see
 "Test.Tasty.Golden.Advanced".
 
-Note about filenames. They are looked up in the usual way, thus relative
+== Filenames
+Filenames are looked up in the usual way, Thus relative
 names are relative to the processes current working directory.
 It is common to run tests from the package's root directory (via @cabal
 test@ or @cabal install --enable-tests@), so if your test files are under
 the @tests\/@ subdirectory, your relative file names should start with
 @tests\/@ (even if your @test.hs@ is itself under @tests\/@, too).
 
-Note about line endings. The best way to avoid headaches with line endings
+== Line endings
+
+The best way to avoid headaches with line endings
 (when running tests both on UNIX and Windows) is to treat your golden files
 as binary, even when they are actually textual.
 
@@ -43,15 +48,40 @@ tests will be broken.
 As a last resort, you can strip all @\\r@s from both arguments in your
 comparison function when necessary. But most of the time treating the files
 as binary does the job.
+
+== Linking
+The test suite should be compiled with @-threaded@ if you want to avoid
+blocking any other threads while 'goldenVsFileDiff' and similar functions
+wait for the result of the diff command.
+
+== Windows limitations
+When using 'goldenVsFileDiff' or 'goldenVsStringDiff' under Windows the exit
+code from the diff program that you specify will not be captured correctly
+if that program uses @exec@.
+
+More specifically, you will get the exit code of the /original child/
+(which always exits with code 0, since it called @exec@), not the exit
+code of the process which carried on with execution after @exec@.
+This is different from the behavior prescribed by POSIX but is the best
+approximation that can be realised under the restrictions of the
+Windows process model.  See 'System.Process' for further details or
+<https://github.com/haskell/process/pull/168> for even more.
+
 -}
 
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Test.Tasty.Golden
-  ( goldenVsFile
+  (
+    -- * Functions to create a golden test
+    goldenVsFile
   , goldenVsString
   , goldenVsFileDiff
   , goldenVsStringDiff
+    -- * Options
   , SizeCutoff(..)
+  , DeleteOutputFile(..)
+    -- * Various utilities
   , writeBinaryFile
   , findByExtension
   , createDirectoriesAndWriteFile
@@ -63,18 +93,21 @@ import Test.Tasty.Golden.Advanced
 import Test.Tasty.Golden.Internal
 import Text.Printf
 import qualified Data.ByteString.Lazy as LBS
-import Data.Monoid
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.Encoding as LT
 import System.IO
 import System.IO.Temp
-import System.Process
+import qualified System.Process.Typed as PT
 import System.Exit
 import System.FilePath
 import System.Directory
 import Control.Exception
 import Control.Monad
 import qualified Data.Set as Set
+import Foreign.C.Error
+#if !MIN_VERSION_base(4,11,0)
+import Data.Monoid
+#endif
 
 -- | Compare the output file's contents against the golden file's contents
 -- after the given action has created the output file.
@@ -85,15 +118,17 @@ goldenVsFile
   -> IO () -- ^ action that creates the output file
   -> TestTree -- ^ the test verifies that the output file contents is the same as the golden file contents
 goldenVsFile name ref new act =
-  goldenTest
+  goldenTest2
     name
     (readFileStrict ref)
     (act >> readFileStrict new)
     cmp
     upd
+    del
   where
   cmp = simpleCmp $ printf "Files '%s' and '%s' differ" ref new
   upd = createDirectoriesAndWriteFile ref
+  del = removeFile new
 
 -- | Compare a given string against the golden file's contents.
 goldenVsString
@@ -121,6 +156,9 @@ simpleCmp e x y =
   return $ if x == y then Nothing else Just e
 
 -- | Same as 'goldenVsFile', but invokes an external diff command.
+--
+-- See the notes at the top of this module regarding linking with
+-- @-threaded@ and Windows-specific issues.
 goldenVsFileDiff
   :: TestName -- ^ test name
   -> (FilePath -> FilePath -> [String])
@@ -136,29 +174,30 @@ goldenVsFileDiff
   -> TestTree
 goldenVsFileDiff name cmdf ref new act =
   askOption $ \sizeCutoff ->
-  goldenTest
+  goldenTest2
     name
-    (return ())
+    (throwIfDoesNotExist ref)
     act
-    (cmp sizeCutoff)
+    (\_ _ -> runDiff (cmdf ref new) sizeCutoff)
     upd
+    del
   where
-  cmd = cmdf ref new
-  cmp sizeCutoff _ _
-    | null cmd = error "goldenVsFileDiff: empty command line"
-    | otherwise = do
-    (_, Just sout, _, pid) <- createProcess (proc (head cmd) (tail cmd)) { std_out = CreatePipe }
-    -- strictly read the whole output, so that the process can terminate
-    out <- hGetContentsStrict sout
-
-    r <- waitForProcess pid
-    return $ case r of
-      ExitSuccess -> Nothing
-      _ -> Just . unpackUtf8 . truncateLargeOutput sizeCutoff $ out
-
   upd _ = readFileStrict new >>= createDirectoriesAndWriteFile ref
+  del = removeFile new
+
+-- If the golden file doesn't exist, throw an isDoesNotExistError that
+-- runGolden will handle by creating the golden file before proceeding.
+-- See #32.
+throwIfDoesNotExist :: FilePath -> IO ()
+throwIfDoesNotExist ref = do
+  exists <- doesFileExist ref
+  unless exists $ ioError $
+    errnoToIOError "goldenVsFileDiff" eNOENT Nothing Nothing
 
 -- | Same as 'goldenVsString', but invokes an external diff command.
+--
+-- See the notes at the top of this module regarding linking with
+-- @-threaded@ and Windows-specific issues.
 goldenVsStringDiff
   :: TestName -- ^ test name
   -> (FilePath -> FilePath -> [String])
@@ -187,17 +226,10 @@ goldenVsStringDiff name cmdf ref act =
     LBS.hPut tmpHandle actBS >> hFlush tmpHandle
 
     let cmd = cmdf ref tmpFile
+    diff_result :: Maybe String <- runDiff cmd sizeCutoff
 
-    when (null cmd) $ error "goldenVsFileDiff: empty command line"
-
-    (_, Just sout, _, pid) <- createProcess (proc (head cmd) (tail cmd)) { std_out = CreatePipe }
-    -- strictly read the whole output, so that the process can terminate
-    out <- hGetContentsStrict sout
-
-    r <- waitForProcess pid
-    return $ case r of
-      ExitSuccess -> Nothing
-      _ -> Just (printf "Test output was different from '%s'. Output of %s:\n" ref (show cmd) <> unpackUtf8 (truncateLargeOutput sizeCutoff out))
+    return $ flip fmap diff_result $ \diff ->
+      printf "Test output was different from '%s'. Output of %s:\n" ref (show cmd) <> diff
 
   upd = createDirectoriesAndWriteFile ref
 
@@ -212,7 +244,8 @@ truncateLargeOutput (SizeCutoff n) str =
       LBS.take n str <> "<truncated>" <>
       "\nUse --accept or increase --size-cutoff to see full output."
 
--- | Like 'writeFile', but uses binary mode.
+-- | Like 'writeFile', but uses binary mode. (Needed only when you work
+-- with 'String'.)
 writeBinaryFile :: FilePath -> String -> IO ()
 writeBinaryFile f txt = withBinaryFile f WriteMode (\hdl -> hPutStr hdl txt)
 
@@ -257,7 +290,7 @@ findByExtension extsList = go where
               then [path]
               else []
 
--- | Like 'BS.writeFile', but also create parent directories if they are
+-- | Like 'LBS.writeFile', but also create parent directories if they are
 -- missing.
 createDirectoriesAndWriteFile
   :: FilePath
@@ -284,12 +317,24 @@ readFileStrict path = do
   evaluate $ forceLbs s
   return s
 
-hGetContentsStrict :: Handle -> IO LBS.ByteString
-hGetContentsStrict h = do
-  hSetBinaryMode h True
-  s <- LBS.hGetContents h
-  evaluate $ forceLbs s
-  return s
-
 unpackUtf8 :: LBS.ByteString -> String
 unpackUtf8 = LT.unpack . LT.decodeUtf8
+
+runDiff
+  :: [String] -- ^ the diff command
+  -> SizeCutoff
+  -> IO (Maybe String)
+runDiff cmd sizeCutoff =
+  case cmd of
+    [] -> throwIO $ ErrorCall "tasty-golden: empty diff command"
+    prog : args -> do
+      let
+        procConf =
+          PT.setStdin PT.closed
+          . PT.setStderr PT.inherit
+          $ PT.proc prog args
+
+      (exitCode, out) <- PT.readProcessStdout procConf
+      return $ case exitCode of
+        ExitSuccess -> Nothing
+        _ -> Just . unpackUtf8 . truncateLargeOutput sizeCutoff $ out
